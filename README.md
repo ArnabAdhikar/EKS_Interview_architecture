@@ -602,6 +602,236 @@ volumeBindingMode: WaitForFirstConsumer  # Ensures AZ alignment
 
 ---
 
+## 🌐 Latency Diagnosis & Karpenter Implementation
+
+This section addresses two advanced scenarios: debugging client-facing latency without cluster telemetry and migrating from Cluster Autoscaler to Karpenter to optimize performance.
+
+---
+
+### Part 1: Diagnosing Domain Latency Without Logs & Metrics
+
+When a client reports high latency accessing the application, but we cannot inspect EKS logs (pod logs, ingress logs) or metrics (CloudWatch, Prometheus), we must use **black-box troubleshooting** from outside the cluster.
+
+#### 1. Command-Line Latency Profiling (cURL)
+We can isolate the delay by measuring the duration of each phase in the HTTP request lifecycle using `curl`:
+
+```bash
+curl -o /dev/null -s -w "\
+DNS Lookup Time:   %{time_namelookup}s\n\
+TCP Connection:    %{time_connect}s\n\
+SSL Handshake:     %{time_appconnect}s\n\
+Time to First Byte (TTFB): %{time_starttransfer}s\n\
+Total Time:        %{time_total}s\n" \
+https://app.arnaba075.com
+```
+
+**Interpretation:**
+- **High DNS Lookup Time:** Point to DNS server latency, misconfigured DNS servers, or propagation delays.
+- **High TCP Connection Time:** Indicates network layer latency, high packet loss, firewall blocking, or routing inefficiencies.
+- **High SSL Handshake Time:** Points to TLS negotiation overhead, resource exhaustion on the Load Balancer (ALB), or cipher suite mismatches.
+- **High TTFB (but low TCP/SSL):** Indicates the application backend is taking a long time to compute the response (e.g., slow database query, pod CPU throttling, or cold start).
+
+#### 2. Isolating DNS vs Routing
+- **Test via Raw ALB DNS:** Bypass Route 53/DNS resolution by hitting the raw AWS ALB DNS name directly:
+  ```bash
+  curl -Iv http://<YOUR-ALB-DNS-NAME>.amazonaws.com
+  ```
+  If this is fast, the latency lies in the custom DNS configuration (e.g., slow Route 53 routing policy, lack of geographic routing, or CDN proxy delay).
+- **Dig/Nslookup checks:** Verify domain resolution and check if resolvers are returning regional/closest IPs:
+  ```bash
+  dig +trace app.arnaba075.com
+  ```
+
+#### 3. Network Path Analysis
+Run path trace tools to identify routing hops and packet loss:
+- **MTR (My Traceroute):** Runs continuous traceroutes to show latency per hop.
+  ```bash
+  mtr -T -P 443 app.arnaba075.com
+  ```
+  This identifies if latency spikes occur at the client ISP, transient public internet hubs, or inside AWS's border network.
+
+#### 4. Geographic Latency
+- If the EKS cluster is deployed in `us-west-2` (Oregon) and the client is in Asia or Europe, speed of light dictates a baseline latency of `150-250ms`.
+- **Solution:** Introduce **Amazon CloudFront** as a CDN in front of the ALB. CloudFront terminates TCP/SSL connections at the nearest Edge Location (reducing TCP handshake latency) and routes traffic back to AWS via the fast AWS backbone network.
+
+#### 5. Client-Side Browser Auditing
+Using browser developer tools (Network tab):
+- **Asset Size & Compression:** Check if resources (JS/CSS bundles) are too large and lack `Content-Encoding: gzip` or `br` (Brotli) compression headers.
+- **HTTP Version:** Ensure the load balancer utilizes HTTP/2 or HTTP/3 to enable multiplexing, preventing HTTP HOL (Head-of-Line) blocking on multiple requests.
+
+---
+
+### Part 2: Implementing Karpenter for High-Performance Scaling
+
+#### Why Cluster Autoscaler (CA) Can Cause Latency
+1. **Slow Provisioning Loop:** CA relies on AWS Auto Scaling Groups (ASGs). When a pod is unschedulable, CA triggers ASG scaling, which launches an EC2 instance. This instance joins the EKS cluster and configures kubelet. This entire process takes **2 to 5 minutes**, causing pods to sit in `Pending` and requests to queue/timeout.
+2. **Rigid Node Type Selection:** CA is locked to the specific instance types configured in the ASG. If a large workload needs a CPU-optimized instance but the ASG only yields general-purpose nodes, scheduling fails or suffers performance degradation.
+
+#### How Karpenter Solves This
+- **Group-less Auto-scaling:** Karpenter bypasses ASGs completely. It communicates directly with AWS EC2 Fleet APIs.
+- **Fast Launch Times:** Karpenter provisions nodes in **15 to 30 seconds**.
+- **Just-in-Time Bin-Packing:** Karpenter evaluates the resource demands (CPU, RAM, GPUs, tolerations) of unschedulable pods and automatically provisions the *exact* instance type and size required to run them efficiently.
+
+---
+
+### Step-by-Step Karpenter Implementation
+
+```mermaid
+graph TD
+    A[Remove Cluster Autoscaler] --> B[Tag VPC Subnets & Security Groups]
+    B --> C[Configure Karpenter IAM Roles & IRSA]
+    C --> D[Install Karpenter Helm Chart]
+    D --> E[Apply EC2NodeClass & NodePool manifests]
+```
+
+#### Step 1: Remove Cluster Autoscaler
+Delete the existing CA manifests and disable the Terraform CA IAM role configuration to avoid conflicting controller instructions:
+```bash
+kubectl delete -f terraform/autoscaler-manifest.tf
+```
+
+#### Step 2: Tag Network Infrastructure
+Karpenter needs to auto-discover subnets and security groups to place newly provisioned nodes. Add the following tags:
+
+- **Private Subnets:**
+  `karpenter.sh/discovery = my-eks-cluster`
+- **Security Groups** (Node SG):
+  `karpenter.sh/discovery = my-eks-cluster`
+
+#### Step 3: Configure IAM Roles & IRSA
+We must create:
+1. **Karpenter Controller IAM Role:** Map this role to Karpenter's Kubernetes ServiceAccount using OIDC. It needs permissions to write EC2 instances, launch templates, and subnets.
+2. **Karpenter Node IAM Role:** Bound to the EKS worker nodes provisioned by Karpenter (Instance Profile).
+
+```hcl
+# terraform/karpenter-iam.tf
+
+# 1. Controller IRSA Role
+module "karpenter_irsa" {
+  source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
+  version = "~> 5.50"
+
+  role_name                          = "karpenter-controller"
+  attach_karpenter_controller_policy = true
+  karpenter_controller_cluster_name  = module.eks.cluster_name
+
+  oidc_providers = {
+    ex = {
+      provider_arn               = module.eks.oidc_provider_arn
+      namespace_service_accounts = ["kube-system:karpenter"]
+    }
+  }
+}
+
+# 2. Node IAM Role (Instance Profile)
+resource "aws_iam_role" "karpenter_node" {
+  name = "KarpenterNodeRole-my-eks-cluster"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "karpenter_node_policies" {
+  for_each = toset([
+    "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy",
+    "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy",
+    "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly",
+    "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+  ])
+  role       = aws_iam_role.karpenter_node.name
+  policy_arn = each.value
+}
+```
+
+#### Step 4: Install Karpenter via Helm
+Deploy Karpenter into the cluster, passing EKS details and controller role ARN:
+
+```bash
+helm registry login public.ecr.aws
+
+helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter \
+  --version "1.0.1" \
+  --namespace "kube-system" \
+  --create-namespace \
+  --set "serviceAccount.annotations.eks\.amazonaws\.com/role-arn=${KARPENTER_CONTROLLER_ROLE_ARN}" \
+  --set "settings.clusterName=my-eks-cluster" \
+  --set "settings.interconnectEndpoint=module.eks.cluster_endpoint" \
+  --wait
+```
+
+#### Step 5: Configure NodePool and EC2NodeClass CRDs
+Karpenter uses two Custom Resource Definitions (CRDs) to manage how nodes are provisioned:
+
+- **`EC2NodeClass`**: Configures AWS-specific details like AMI family, subnets, security groups, and user-data.
+- **`NodePool`**: Configures scheduling constraints, instance type limits, capacity types, and node consolidation/eviction policies.
+
+Create `k8s_manifests/karpenter-config.yaml`:
+
+```yaml
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: default
+spec:
+  amiFamily: AL2023 # Modern Amazon Linux 2023 optimized for EKS
+  role: KarpenterNodeRole-my-eks-cluster
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: my-eks-cluster
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: my-eks-cluster
+  amiSelectorTerms:
+    - alias: al2023@latest # Automatically uses EKS-optimized AL2023 AMI
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: default
+spec:
+  template:
+    spec:
+      requirements:
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64", "arm64"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand", "spot"]
+        - key: karpenter.k8s.aws/instance-category
+          operator: In
+          values: ["c", "m", "r"]
+        - key: karpenter.k8s.aws/instance-generation
+          operator: Gt
+          values: ["2"]
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: default
+  # Resource limits (limits cost by capping maximum cluster footprint)
+  limits:
+    cpu: 1000
+    memory: 4000Gi
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 1m
+```
+
+Apply the Karpenter configuration:
+```bash
+kubectl apply -f k8s_manifests/karpenter-config.yaml
+```
+
+Once applied, Karpenter will actively monitor unschedulable pods, provision nodes matching their constraints within seconds, and consolidate underutilized nodes to keep infrastructure costs minimized.
+
+---
+
 ## 🏷️ Tech Stack Summary
 
 | Layer | Technology |
