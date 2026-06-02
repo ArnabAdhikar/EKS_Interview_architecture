@@ -28,6 +28,10 @@ spec:
         env:
           - name: REACT_APP_BACKEND_URL
             value: "/api/tasks" # Use relative path since frontend and backend are on the same ALB
+          - name: OTEL_EXPORTER_OTLP_ENDPOINT
+            value: "http://otel-collector-svc.workshop.svc.cluster.local:4317"
+          - name: OTEL_SERVICE_NAME
+            value: "frontend-web"
         ports:
         - containerPort: 3000
         # livenessProbe:

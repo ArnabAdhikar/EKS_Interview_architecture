@@ -1,0 +1,23 @@
+# k8s_manifests/alertmanager-config.yaml
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: AlertmanagerConfig
+metadata:
+  name: slack-routing
+  namespace: prometheus
+spec:
+  route:
+    groupBy: ['alertname', 'namespace']
+    groupWait: 30s
+    groupInterval: 5m
+    repeatInterval: 12h
+    receiver: 'slack-notifications'
+  receivers:
+  - name: 'slack-notifications'
+    slackConfigs:
+    - apiURL:
+        key: webhook-url
+        name: slack-webhook-secret
+      channel: '#eks-ops-alerts'
+      sendResolved: true
+      title: '[[{{ .Status | toUpper }}]] EKS Alert'
+      text: 'Alert: {{ .CommonAnnotations.summary }}\nDetails: {{ .CommonAnnotations.description }}'
